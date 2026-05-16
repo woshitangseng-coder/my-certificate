@@ -1,0 +1,17 @@
+{
+  "name": "cert-query",
+  "version": "1.0.0",
+  "private": true,
+  "description": "机读目录格式编目员上岗证书查询站",
+  "scripts": {
+    "convert": "node convert.js",
+    "sync": "node sync-feishu.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "xlsx": "^0.18.5"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
