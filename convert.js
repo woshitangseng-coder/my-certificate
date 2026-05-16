@@ -33,12 +33,55 @@ function usage() {
 `);
 }
 
+function normalizeHeaderCell(value) {
+  return String(value ?? "")
+    .replace(/\uFEFF/g, "")
+    .replace(/\s+/g, "")
+    .trim();
+}
+
 function findColumnIndex(headerRow, aliases) {
+  const normalizedAliases = aliases.map(normalizeHeaderCell);
   for (let i = 0; i < headerRow.length; i++) {
-    const cell = String(headerRow[i] ?? "").trim();
-    if (aliases.includes(cell)) return i;
+    const cell = normalizeHeaderCell(headerRow[i]);
+    if (!cell) continue;
+    if (normalizedAliases.includes(cell)) return i;
+    if (aliases.some((a) => cell.includes(normalizeHeaderCell(a)))) return i;
   }
   return -1;
+}
+
+function findHeaderRowIndex(rows) {
+  const maxScan = Math.min(rows.length, 15);
+  let bestIdx = 0;
+  let bestScore = -1;
+
+  for (let r = 0; r < maxScan; r++) {
+    const row = rows[r] || [];
+    const col = {
+      name: findColumnIndex(row, HEADERS.name),
+      gender: findColumnIndex(row, HEADERS.gender),
+      certNo: findColumnIndex(row, HEADERS.certNo),
+      expiry: findColumnIndex(row, HEADERS.expiry),
+    };
+    const score = Object.values(col).filter((i) => i >= 0).length;
+    if (score > bestScore) {
+      bestScore = score;
+      bestIdx = r;
+    }
+    if (score === 4) return r;
+  }
+
+  return bestIdx;
+}
+
+function formatRowPreview(row) {
+  return (row || [])
+    .map((c) => {
+      const s = String(c ?? "").trim();
+      return s || "(空)";
+    })
+    .join(" | ");
 }
 
 function cellToString(value) {
@@ -51,13 +94,57 @@ function cellToString(value) {
   return String(value).trim();
 }
 
-function parseSheet(sheet) {
+/** Excel 日期序列号（如 47543）→ 2030年3月 */
+function isExcelSerial(n) {
+  return typeof n === "number" && Number.isFinite(n) && n >= 20000 && n <= 80000;
+}
+
+function formatExpiry(value) {
+  if (value == null || value === "") return "";
+
+  if (value instanceof Date && !Number.isNaN(value.getTime())) {
+    return `${value.getFullYear()}年${value.getMonth() + 1}月`;
+  }
+
+  if (typeof value === "number" && isExcelSerial(value)) {
+    return excelSerialToYearMonth(value);
+  }
+
+  const str = String(value).trim();
+  if (/年/.test(str)) return str;
+
+  const num = Number(str);
+  if (str !== "" && !Number.isNaN(num) && isExcelSerial(num)) {
+    return excelSerialToYearMonth(num);
+  }
+
+  return str;
+}
+
+function excelSerialToYearMonth(serial) {
+  const code = Math.floor(Number(serial));
+  if (XLSX.SSF && typeof XLSX.SSF.parse_date_code === "function") {
+    const parsed = XLSX.SSF.parse_date_code(code);
+    if (parsed && parsed.y) {
+      return `${parsed.y}年${parsed.m}月`;
+    }
+  }
+  const utcDays = code - 25569;
+  const date = new Date(utcDays * 86400 * 1000);
+  if (!Number.isNaN(date.getTime())) {
+    return `${date.getUTCFullYear()}年${date.getUTCMonth() + 1}月`;
+  }
+  return String(serial);
+}
+
+function parseSheet(sheet, sheetName) {
   const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "" });
   if (rows.length < 2) {
     throw new Error("表格至少需要表头行和一行数据");
   }
 
-  const headerRow = rows[0].map((c) => String(c).trim());
+  const headerRowIndex = findHeaderRowIndex(rows);
+  const headerRow = rows[headerRowIndex] || [];
   const col = {
     name: findColumnIndex(headerRow, HEADERS.name),
     gender: findColumnIndex(headerRow, HEADERS.gender),
@@ -69,17 +156,29 @@ function parseSheet(sheet) {
     .filter(([, idx]) => idx < 0)
     .map(([key]) => HEADERS[key][0]);
   if (missing.length) {
-    throw new Error(`缺少列: ${missing.join("、")}`);
+    const preview = rows
+      .slice(0, Math.min(5, rows.length))
+      .map((row, i) => `  第 ${i + 1} 行: ${formatRowPreview(row)}`)
+      .join("\n");
+    throw new Error(
+      `缺少列: ${missing.join("、")}\n` +
+        `工作表「${sheetName}」前 5 行内容:\n${preview}\n` +
+        `请确认表头为: 姓名、性别、证书编号、证书有效期（可在第 1～15 行内）`
+    );
+  }
+
+  if (headerRowIndex > 0) {
+    console.log(`已识别第 ${headerRowIndex + 1} 行为表头`);
   }
 
   const records = [];
-  for (let r = 1; r < rows.length; r++) {
+  for (let r = headerRowIndex + 1; r < rows.length; r++) {
     const row = rows[r];
     const record = {
       name: cellToString(row[col.name]),
       gender: cellToString(row[col.gender]),
       certNo: cellToString(row[col.certNo]),
-      expiry: cellToString(row[col.expiry]),
+      expiry: formatExpiry(row[col.expiry]),
     };
     if (!record.certNo && !record.name) continue;
     if (!record.certNo) {
@@ -150,9 +249,10 @@ function main() {
     process.exit(1);
   }
 
-  const workbook = XLSX.readFile(inputPath);
+  const workbook = XLSX.readFile(inputPath, { cellDates: true });
+  console.log(`工作表: ${workbook.SheetNames.join("、")}`);
   const sheetName = workbook.SheetNames[0];
-  let records = parseSheet(workbook.Sheets[sheetName]);
+  let records = parseSheet(workbook.Sheets[sheetName], sheetName);
 
   if (merge) {
     records = mergeRecords(loadExisting(outputPath), records);
